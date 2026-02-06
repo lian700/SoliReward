@@ -10,11 +10,28 @@ Post-training alignment of video generation models with human preferences is a c
 
 ![Pipeline](assets/pipeline.png)
 
+## Model Zoo
+
+This repository contains the code for SoliReward. The model weights are hosted on Hugging Face at [Yukino271828/SoliReward](https://huggingface.co/Yukino271828/SoliReward).
+
+The project primarily utilizes the following two checkpoints located in the `pixel_orm` directory:
+
+| Model Path                                      | Focus Dimension                               |
+| :---------------------------------------------- | :-------------------------------------------- |
+| `pixel_orm/physics-deformity-HPQA-InternVL3-1B` | **Physical Plausibility & Subject Deformity** |
+| `pixel_orm/TA-HPQA-InternVL3-1B`                | **Text Alignment (Semantic Consistency)**     |
+
+You can download only these specific checkpoints using the following command:
+
+```bash
+huggingface-cli download Yukino271828/SoliReward --include "pixel_orm/*" --local-dir checkpoints
+```
+
 ## TODO
 
 - [x] Release training code
 - [x] Release inference code
-- [ ] Release model weights
+- [x] Release model weights
 
 ## Quick Start
 
