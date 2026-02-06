@@ -1,0 +1,3 @@
+IMG_START_TOKEN = '<img>'
+IMG_END_TOKEN = '</img>'
+IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
