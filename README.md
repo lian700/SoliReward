@@ -1,10 +1,20 @@
-# SoliReward
-
-**Video Reward Model Training Framework**
+# SoliReward: Mitigating Susceptibility to Reward Hacking and Annotation Noise in Video Generation Reward Models
 
 [![Paper](https://img.shields.io/badge/arXiv-2512.22170-b31b1b.svg)](https://arxiv.org/abs/2512.22170)
 
-SoliReward is a framework for training and inferencing video reward models, supporting multiple model architectures including InternVL3, InternVL3-5, Qwen2.5-VL, and Qwen2-VL. This framework corresponds to the paper **"SoliReward: Mitigating Susceptibility to Reward Hacking and Annotation Noise in Video Generation Reward Models"**.
+## Abstract
+
+Post-training alignment of video generation models with human preferences is a critical goal. Developing effective Reward Models (RMs) for this process faces significant methodological hurdles. Current data collection paradigms, reliant on in-prompt pairwise annotations, suffer from labeling noise. Concurrently, the architectural design of VLM-based RMs, particularly their output mechanisms, remains underexplored. Furthermore, RM is susceptible to reward hacking in post-training. To mitigate these limitations, we propose SoliReward, a systematic framework for video RM training. Our framework first sources high-quality, cost-efficient data via single-item binary annotations, then constructs preference pairs using a cross-prompt pairing strategy. Architecturally, we employ a Hierarchical Progressive Query Attention mechanism to enhance feature aggregation. Finally, we introduce a modified BT loss that explicitly accommodates win-tie scenarios. This approach regularizes the RM's score distribution for positive samples, providing more nuanced preference signals to alleviate over-focus on a small number of top-scoring samples. Our approach is validated on benchmarks evaluating physical plausibility, subject deformity, and semantic alignment, demonstrating improvements in direct RM evaluation metrics and in the efficacy of post-training on video generation models. Code and benchmark will be publicly available.
+
+## Pipeline
+
+![Pipeline](assets/pipeline.png)
+
+## TODO
+
+- [x] Release training code
+- [x] Release inference code
+- [ ] Release model weights
 
 ## Quick Start
 
@@ -96,6 +106,15 @@ If you find this project helpful for your research, please cite our paper:
   year={2025}
 }
 ```
+
+## Acknowledgments
+
+This project is built upon the following excellent open-source projects:
+
+- [Transformers](https://github.com/huggingface/transformers)
+- [TRL](https://github.com/huggingface/trl)
+
+We thank the Hugging Face team for their valuable contributions to the open-source community.
 
 ## License
 
