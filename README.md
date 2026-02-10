@@ -1,6 +1,7 @@
 # SoliReward: Mitigating Susceptibility to Reward Hacking and Annotation Noise in Video Generation Reward Models
 
 [![Paper](https://img.shields.io/badge/arXiv-2512.22170-b31b1b.svg)](https://arxiv.org/abs/2512.22170)
+[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/Yukino271828/SoliReward)
 
 ## Abstract
 
