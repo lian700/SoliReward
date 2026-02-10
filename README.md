@@ -32,6 +32,7 @@ huggingface-cli download Yukino271828/SoliReward --include "pixel_orm/*" --local
 - [x] Release training code
 - [x] Release inference code
 - [x] Release model weights
+- [ ] Release benchmark
 
 ## Quick Start
 
