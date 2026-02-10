@@ -60,6 +60,9 @@ Modify the configuration in `scripts/solireward_infer.sh` and run:
 bash scripts/solireward_infer.sh
 ```
 
+### 4. Post-Training
+The post-training code can be found in our companion repository: 👉[Euphonium](https://github.com/zerzerzerz/Euphonium.git)
+
 ## Supported Models
 
 | Model Type  | Parameter Name | Description               |
