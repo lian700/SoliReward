@@ -2,7 +2,13 @@ from typing import Optional
 from .image_placeholder import IMG_CONTEXT_TOKEN
 from .modeling_internvl_chat import InternVLChatModel
 from ...config import InternVLArguments
-from ..attention_query import AttentionQuery, create_reward_head
+from ..attention_query import (
+    AttentionQuery,
+    create_reward_head,
+    masked_sequence_pool,
+    normalize_attention_mask,
+    select_last_non_padding,
+)
 import torch
 import torch.nn as nn
 
@@ -114,7 +120,11 @@ class InternVLBaseRewardModel:
         else:
             raise ValueError(f"Unsupported reduce_sequence: {self.reduce_sequence}")
     
-    def process_reward_outputs(self, outputs):
+    def process_reward_outputs(
+        self,
+        outputs,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
         """
         Process model outputs to extract reward scores.
         
@@ -133,7 +143,7 @@ class InternVLBaseRewardModel:
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
         
         # Extract last token logits (batch_size, vocab_size)
-        last_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
+        last_token_logits = select_last_non_padding(logits, attention_mask)
         
         # Extract logits for "good" and "bad" tokens (without softmax)
         good_logits = last_token_logits[:, self._good_token_id]  # Shape: (batch_size,)
@@ -146,7 +156,9 @@ class InternVLBaseRewardModel:
             if self.attention_query is None or self.reward_head is None:
                 raise RuntimeError("Attention modules are not initialized for reduce_sequence='attention'.")
             last_hidden_states = hidden_states[-1]  # (batch_size, seq_len, hidden_size)
-            attn_output = self.attention_query([last_hidden_states])  # (batch_size, num_queries=1, hidden_size)
+            attn_output = self.attention_query(
+                [last_hidden_states], attention_mask=attention_mask
+            )  # (batch_size, num_queries=1, hidden_size)
             attn_output = attn_output.squeeze(1)  # (batch_size, hidden_size)
             reward_scores = self.reward_head(attn_output).squeeze(-1)  # (batch_size,)
 
@@ -156,12 +168,16 @@ class InternVLBaseRewardModel:
             if self.attention_query_multi_layer is None or self.attention_query_multi_layer_reduce is None or self.attention_query_final_layer is None or self.reward_head is None:
                 raise RuntimeError("Hierarchical attention modules are not initialized correctly.")
             selected_hidden_states = [hidden_states[i] for i in self.hierarchical_query_attn_layers]
-            attn_output = self.attention_query_multi_layer(selected_hidden_states)  # (batch_size, num_queries, hidden_size)
+            attn_output = self.attention_query_multi_layer(
+                selected_hidden_states, attention_mask=attention_mask
+            )  # (batch_size, num_queries, hidden_size)
             attn_output = self.attention_query_multi_layer_reduce([attn_output])  # (batch_size, 1, hidden_size)
             attn_output = attn_output.squeeze(1)  # (batch_size, hidden_size)
 
             last_hidden_states = hidden_states[-1]  # (batch_size, seq_len, hidden_size)
-            attn_output_final_layer = self.attention_query_final_layer([last_hidden_states])
+            attn_output_final_layer = self.attention_query_final_layer(
+                [last_hidden_states], attention_mask=attention_mask
+            )
             attn_output_final_layer = attn_output_final_layer.squeeze(1)  # (batch_size, hidden_size)
             attn_output = attn_output + attn_output_final_layer  # (batch_size, hidden_size)
             reward_scores = self.reward_head(attn_output).squeeze(-1)  # (batch_size,)
@@ -180,14 +196,20 @@ class InternVLBaseRewardModel:
             for idx, seq in enumerate(selected_hidden_states):
                 batch_size = seq.size(0)
                 query = shared_query.repeat(batch_size, 1, 1)  # (batch_size, 1, hidden_size)
-                attn_output, _ = self.attention_query_multi_layer.attention[idx](query, seq, seq)  # (batch_size, 1, hidden_size)
+                mask = normalize_attention_mask(attention_mask, seq)
+                key_padding_mask = None if mask is None else ~mask
+                attn_output, _ = self.attention_query_multi_layer.attention[idx](
+                    query, seq, seq, key_padding_mask=key_padding_mask
+                )  # (batch_size, 1, hidden_size)
                 attn_outputs.append(attn_output)
             attn_outputs = torch.cat(attn_outputs, dim=1)  # (batch_size, num_queries, hidden_size)
             attn_output = self.attention_query_multi_layer_reduce([attn_outputs])  # (batch_size, 1, hidden_size)
             attn_output = attn_output.squeeze(1)  # (batch_size, hidden_size)
 
             last_hidden_states = hidden_states[-1]  # (batch_size, seq_len, hidden_size)
-            attn_output_final_layer = self.attention_query_final_layer([last_hidden_states])
+            attn_output_final_layer = self.attention_query_final_layer(
+                [last_hidden_states], attention_mask=attention_mask
+            )
             attn_output_final_layer = attn_output_final_layer.squeeze(1)  # (batch_size, hidden_size)
             attn_output = attn_output + attn_output_final_layer  # (batch_size, hidden_size)
             reward_scores = self.reward_head(attn_output).squeeze(-1)  # (batch_size,)
@@ -198,7 +220,9 @@ class InternVLBaseRewardModel:
             if self.attention_query_multi_layer is None or self.attention_query_multi_layer_reduce is None or self.reward_head is None:
                 raise RuntimeError("Hierarchical attention v2 modules are not initialized correctly.")
             selected_hidden_states = [hidden_states[i] for i in self.hierarchical_query_attn_layers]
-            attn_output = self.attention_query_multi_layer(selected_hidden_states)  # (batch_size, num_queries, hidden_size)
+            attn_output = self.attention_query_multi_layer(
+                selected_hidden_states, attention_mask=attention_mask
+            )  # (batch_size, num_queries, hidden_size)
             attn_output = self.attention_query_multi_layer_reduce([attn_output])  # (batch_size, 1, hidden_size)
             attn_output = attn_output.squeeze(1)  # (batch_size, hidden_size)
             reward_scores = self.reward_head(attn_output).squeeze(-1)  # (batch_size,)
@@ -208,12 +232,24 @@ class InternVLBaseRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='progressive_hierarchical_attention'. Ensure output_hidden_states=True.")
             if self.attention_query_first_layer is None or self.attention_query_other_layers is None or self.attention_query_final_layer is None or self.reward_head is None:
                 raise RuntimeError("Progressive hierarchical attention modules are not initialized correctly.")
-            query = self.attention_query_first_layer([hidden_states[self.hierarchical_query_attn_layers[0]]])  # (batch_size, 1, hidden_size)
-            for layer_idx in self.hierarchical_query_attn_layers[1:]:
+            query = self.attention_query_first_layer(
+                [hidden_states[self.hierarchical_query_attn_layers[0]]],
+                attention_mask=attention_mask,
+            )  # (batch_size, 1, hidden_size)
+            for idx, layer_idx in enumerate(self.hierarchical_query_attn_layers[1:]):
                 key_value = hidden_states[layer_idx]  # (batch_size, seq_len, hidden_size)
-                query, _ = self.attention_query_other_layers[self.hierarchical_query_attn_layers.index(layer_idx)-1](query, key_value, key_value)  # (batch_size, 1, hidden_size)
+                mask = normalize_attention_mask(attention_mask, key_value)
+                key_padding_mask = None if mask is None else ~mask
+                query, _ = self.attention_query_other_layers[idx](
+                    query,
+                    key_value,
+                    key_value,
+                    key_padding_mask=key_padding_mask,
+                )  # (batch_size, 1, hidden_size)
             query = query.squeeze(1)  # (batch_size, hidden_size)
-            attn_output_final_layer = self.attention_query_final_layer([hidden_states[-1]])
+            attn_output_final_layer = self.attention_query_final_layer(
+                [hidden_states[-1]], attention_mask=attention_mask
+            )
             attn_output_final_layer = attn_output_final_layer.squeeze(1)  # (batch_size, hidden_size)
             query = query + attn_output_final_layer  # (batch_size, hidden_size)
             reward_scores = self.reward_head(query).squeeze(-1)  # (batch_size,)
@@ -224,7 +260,7 @@ class InternVLBaseRewardModel:
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='maxpool'.")
             last_hidden_states = hidden_states[-1]
-            pooled = last_hidden_states.max(dim=1).values
+            pooled = masked_sequence_pool(last_hidden_states, attention_mask, mode="max")
             reward_scores = self.reward_head(pooled).squeeze(-1)
 
         elif self.reduce_sequence == 'last_token_hidden_state':
@@ -232,8 +268,7 @@ class InternVLBaseRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='last_token_hidden_state'. Ensure output_hidden_states=True.")
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='last_token_hidden_state'.")
-            last_hidden_states = hidden_states[-1]
-            last_token_state = last_hidden_states[:, -1, :]
+            last_token_state = select_last_non_padding(hidden_states[-1], attention_mask)
             reward_scores = self.reward_head(last_token_state).squeeze(-1)
         elif self.reduce_sequence == 'meanpool':
             if hidden_states is None:
@@ -241,7 +276,7 @@ class InternVLBaseRewardModel:
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='meanpool'.")
             last_hidden_states = hidden_states[-1]
-            pooled = last_hidden_states.mean(dim=1)
+            pooled = masked_sequence_pool(last_hidden_states, attention_mask, mode="mean")
             reward_scores = self.reward_head(pooled).squeeze(-1)
             
 
@@ -314,13 +349,16 @@ class InternVL3RewardModel(InternVLChatModel, InternVLBaseRewardModel):
             - bad_logits: Logit of "bad" token
         """
         return_dict = kwargs.get('return_dict', True)
+        attention_mask = kwargs.get('attention_mask')
+        if attention_mask is None and len(args) > 2:
+            attention_mask = args[2]
         kwargs['output_hidden_states'] = True  # Ensure hidden states are returned for reward processing
         
         # Call the chat model's forward pass
         outputs = InternVLChatModel.forward(self, *args, **kwargs)
         
         # Process outputs through base reward model
-        result = self.process_reward_outputs(outputs)
+        result = self.process_reward_outputs(outputs, attention_mask=attention_mask)
         
         if not return_dict:
             # Return as tuple if return_dict is False
