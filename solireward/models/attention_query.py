@@ -1,10 +1,65 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-import math
-from einops import rearrange, repeat
+from typing import Optional, Union
+
+from einops import repeat
+
+
+def normalize_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    sequence: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Validate and normalize a token attention mask to a boolean tensor."""
+    if attention_mask is None:
+        return None
+    if attention_mask.dim() != 2:
+        raise ValueError(
+            f"attention_mask must have shape (batch_size, seq_len), got {tuple(attention_mask.shape)}"
+        )
+    if attention_mask.shape != sequence.shape[:2]:
+        raise ValueError(
+            "attention_mask shape must match the sequence batch and length dimensions: "
+            f"got {tuple(attention_mask.shape)} and {tuple(sequence.shape[:2])}"
+        )
+
+    mask = attention_mask.to(device=sequence.device, dtype=torch.bool)
+    if not mask.any(dim=1).all():
+        raise ValueError("attention_mask contains a sample with no non-PAD tokens")
+    return mask
+
+
+def select_last_non_padding(
+    sequence: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Select each sample's last real token, independent of padding side."""
+    mask = normalize_attention_mask(attention_mask, sequence)
+    if mask is None:
+        return sequence[:, -1, :]
+
+    positions = torch.arange(sequence.size(1), device=sequence.device).unsqueeze(0)
+    last_indices = positions.masked_fill(~mask, -1).max(dim=1).values
+    batch_indices = torch.arange(sequence.size(0), device=sequence.device)
+    return sequence[batch_indices, last_indices]
+
+
+def masked_sequence_pool(
+    sequence: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    mode: str,
+) -> torch.Tensor:
+    """Mean- or max-pool a sequence while excluding PAD positions."""
+    mask = normalize_attention_mask(attention_mask, sequence)
+    if mask is None:
+        return sequence.mean(dim=1) if mode == "mean" else sequence.max(dim=1).values
+
+    if mode == "mean":
+        weights = mask.unsqueeze(-1).to(sequence.dtype)
+        return (sequence * weights).sum(dim=1) / weights.sum(dim=1)
+    if mode == "max":
+        return sequence.masked_fill(~mask.unsqueeze(-1), torch.finfo(sequence.dtype).min).max(dim=1).values
+    raise ValueError(f"Unsupported pooling mode: {mode}")
 
 class AttentionQuery(nn.Module):
     """
@@ -61,21 +116,38 @@ class AttentionQuery(nn.Module):
         
         self._initialized = True
     
-    def forward(self, seq_list: list[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        seq_list: list[torch.Tensor],
+        attention_mask: Optional[Union[torch.Tensor, list[Optional[torch.Tensor]]]] = None,
+    ) -> torch.Tensor:
         """
         Forward pass to compute attention-based sequence reduction.
         Args:
             seq_list: List of input sequences, each of shape (batch_size, seq_len, hidden_size)
+            attention_mask: Token mask shared by all sequences, or one mask per sequence.
         Returns:
             Tensor of shape (batch_size, num_queries, hidden_size) after attention-based reduction
         """
         num_query = len(seq_list)
         assert num_query == self.num_queries, f"Expected {self.num_queries} sequences, but got {num_query}"
+        if isinstance(attention_mask, list) and len(attention_mask) != num_query:
+            raise ValueError(
+                f"Expected {num_query} attention masks, but got {len(attention_mask)}"
+            )
         outputs = []
         for i, seq in enumerate(seq_list):
             batch_size = seq.size(0)
             query = repeat(self.query.weight[i], 'hidden_size -> batch_size 1 hidden_size', batch_size=batch_size)  # (batch_size, 1, hidden_size)
-            attn_output, _ = self.attention[i](query, seq, seq)  # (batch_size, 1, hidden_size)
+            seq_mask = attention_mask[i] if isinstance(attention_mask, list) else attention_mask
+            seq_mask = normalize_attention_mask(seq_mask, seq)
+            key_padding_mask = None if seq_mask is None else ~seq_mask
+            attn_output, _ = self.attention[i](
+                query,
+                seq,
+                seq,
+                key_padding_mask=key_padding_mask,
+            )  # (batch_size, 1, hidden_size)
             outputs.append(attn_output)
         outputs = torch.cat(outputs, dim=1)  # (batch_size, num_queries, hidden_size)
         return outputs  # (batch_size, num_queries, hidden_size)
