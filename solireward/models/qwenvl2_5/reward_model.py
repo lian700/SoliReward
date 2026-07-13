@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLForConditionalGeneration
 
-from ..attention_query import AttentionQuery, create_reward_head
+from ..attention_query import (
+    AttentionQuery,
+    create_reward_head,
+    masked_sequence_pool,
+    normalize_attention_mask,
+    select_last_non_padding,
+)
 from ...config import QwenVLArguments
 
 
@@ -123,7 +129,12 @@ class BaseQwenVLRewardModel:
         else:
             raise ValueError(f"Unsupported reduce_sequence: {self.reduce_sequence}")
 
-    def process_outputs_for_reward(self, outputs, return_dict: bool = True):
+    def process_outputs_for_reward(
+        self,
+        outputs,
+        return_dict: bool = True,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
         """Process model outputs to extract reward scores and supporting tensors."""
         hidden_states = getattr(outputs, 'hidden_states', None)
 
@@ -132,7 +143,7 @@ class BaseQwenVLRewardModel:
         else:
             logits = outputs[0] if isinstance(outputs, tuple) else outputs
 
-        last_token_logits = logits[:, -1, :]
+        last_token_logits = select_last_non_padding(logits, attention_mask)
         good_logits = last_token_logits[:, self._good_token_id]
         bad_logits = last_token_logits[:, self._bad_token_id]
 
@@ -145,7 +156,9 @@ class BaseQwenVLRewardModel:
             if self.attention_query is None or self.reward_head is None:
                 raise RuntimeError("Attention modules are not initialized for reduce_sequence='attention'.")
             last_hidden_states = hidden_states[-1]
-            attn_output = self.attention_query([last_hidden_states]).squeeze(1)
+            attn_output = self.attention_query(
+                [last_hidden_states], attention_mask=attention_mask
+            ).squeeze(1)
             reward_scores = self.reward_head(attn_output).squeeze(-1)
 
         elif self.reduce_sequence == 'hierarchical_attention':
@@ -154,9 +167,13 @@ class BaseQwenVLRewardModel:
             if self.attention_query_multi_layer is None or self.attention_query_multi_layer_reduce is None or self.attention_query_final_layer is None or self.reward_head is None:
                 raise RuntimeError("Hierarchical attention modules are not initialized correctly.")
             selected_hidden_states = [hidden_states[i] for i in self.hierarchical_query_attn_layers]
-            attn_output = self.attention_query_multi_layer(selected_hidden_states)
+            attn_output = self.attention_query_multi_layer(
+                selected_hidden_states, attention_mask=attention_mask
+            )
             attn_output = self.attention_query_multi_layer_reduce([attn_output]).squeeze(1)
-            attn_output_final = self.attention_query_final_layer([hidden_states[-1]]).squeeze(1)
+            attn_output_final = self.attention_query_final_layer(
+                [hidden_states[-1]], attention_mask=attention_mask
+            ).squeeze(1)
             reward_scores = self.reward_head(attn_output + attn_output_final).squeeze(-1)
 
         elif self.reduce_sequence == 'hierarchical_attention-shared':
@@ -170,11 +187,17 @@ class BaseQwenVLRewardModel:
             for idx, seq in enumerate(selected_hidden_states):
                 batch_size = seq.size(0)
                 query = shared_query.repeat(batch_size, 1, 1)
-                attn_output, _ = self.attention_query_multi_layer.attention[idx](query, seq, seq)
+                mask = normalize_attention_mask(attention_mask, seq)
+                key_padding_mask = None if mask is None else ~mask
+                attn_output, _ = self.attention_query_multi_layer.attention[idx](
+                    query, seq, seq, key_padding_mask=key_padding_mask
+                )
                 attn_outputs.append(attn_output)
             attn_outputs = torch.cat(attn_outputs, dim=1)
             attn_output = self.attention_query_multi_layer_reduce([attn_outputs]).squeeze(1)
-            attn_output_final = self.attention_query_final_layer([hidden_states[-1]]).squeeze(1)
+            attn_output_final = self.attention_query_final_layer(
+                [hidden_states[-1]], attention_mask=attention_mask
+            ).squeeze(1)
             reward_scores = self.reward_head(attn_output + attn_output_final).squeeze(-1)
 
         elif self.reduce_sequence == 'hierarchical_attention-v2':
@@ -183,7 +206,9 @@ class BaseQwenVLRewardModel:
             if self.attention_query_multi_layer is None or self.attention_query_multi_layer_reduce is None or self.reward_head is None:
                 raise RuntimeError("Hierarchical attention v2 modules are not initialized correctly.")
             selected_hidden_states = [hidden_states[i] for i in self.hierarchical_query_attn_layers]
-            attn_output = self.attention_query_multi_layer(selected_hidden_states)
+            attn_output = self.attention_query_multi_layer(
+                selected_hidden_states, attention_mask=attention_mask
+            )
             attn_output = self.attention_query_multi_layer_reduce([attn_output]).squeeze(1)
             reward_scores = self.reward_head(attn_output).squeeze(-1)
 
@@ -192,12 +217,24 @@ class BaseQwenVLRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='progressive_hierarchical_attention'. Set output_hidden_states=True.")
             if self.attention_query_first_layer is None or self.attention_query_other_layers is None or self.attention_query_final_layer is None or self.reward_head is None:
                 raise RuntimeError("Progressive hierarchical attention modules are not initialized correctly.")
-            query = self.attention_query_first_layer([hidden_states[self.hierarchical_query_attn_layers[0]]])
+            query = self.attention_query_first_layer(
+                [hidden_states[self.hierarchical_query_attn_layers[0]]],
+                attention_mask=attention_mask,
+            )
             for idx, layer_idx in enumerate(self.hierarchical_query_attn_layers[1:]):
                 key_value = hidden_states[layer_idx]
-                query, _ = self.attention_query_other_layers[idx](query, key_value, key_value)
+                mask = normalize_attention_mask(attention_mask, key_value)
+                key_padding_mask = None if mask is None else ~mask
+                query, _ = self.attention_query_other_layers[idx](
+                    query,
+                    key_value,
+                    key_value,
+                    key_padding_mask=key_padding_mask,
+                )
             query = query.squeeze(1)
-            attn_output_final = self.attention_query_final_layer([hidden_states[-1]]).squeeze(1)
+            attn_output_final = self.attention_query_final_layer(
+                [hidden_states[-1]], attention_mask=attention_mask
+            ).squeeze(1)
             reward_scores = self.reward_head(query + attn_output_final).squeeze(-1)
 
         elif self.reduce_sequence == 'maxpool':
@@ -205,7 +242,7 @@ class BaseQwenVLRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='maxpool'. Set output_hidden_states=True.")
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='maxpool'.")
-            pooled = hidden_states[-1].max(dim=1).values
+            pooled = masked_sequence_pool(hidden_states[-1], attention_mask, mode="max")
             reward_scores = self.reward_head(pooled).squeeze(-1)
 
         elif self.reduce_sequence == 'meanpool':
@@ -213,7 +250,7 @@ class BaseQwenVLRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='meanpool'. Set output_hidden_states=True.")
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='meanpool'.")
-            pooled = hidden_states[-1].mean(dim=1)
+            pooled = masked_sequence_pool(hidden_states[-1], attention_mask, mode="mean")
             reward_scores = self.reward_head(pooled).squeeze(-1)
 
         elif self.reduce_sequence == 'last_token_hidden_state':
@@ -221,8 +258,7 @@ class BaseQwenVLRewardModel:
                 raise ValueError("Hidden states are required when reduce_sequence='last_token_hidden_state'. Set output_hidden_states=True.")
             if self.reward_head is None:
                 raise RuntimeError("Reward head is not initialized for reduce_sequence='last_token_hidden_state'.")
-            last_hidden_states = hidden_states[-1]
-            last_token_state = last_hidden_states[:, -1, :]
+            last_token_state = select_last_non_padding(hidden_states[-1], attention_mask)
             reward_scores = self.reward_head(last_token_state).squeeze(-1)
 
         else:
@@ -298,12 +334,17 @@ class Qwen2VLRewardModel(Qwen2VLForConditionalGeneration, BaseQwenVLRewardModel)
             - Other standard outputs (loss, past_key_values, etc.)
         """
         return_dict = kwargs.get('return_dict', True)
+        attention_mask = kwargs.get('attention_mask')
+        if attention_mask is None and len(args) > 1:
+            attention_mask = args[1]
         kwargs['output_hidden_states'] = True
 
         outputs = super().forward(*args, **kwargs)
         
         # Step 2: Process outputs to add reward scores
-        return self.process_outputs_for_reward(outputs, return_dict)
+        return self.process_outputs_for_reward(
+            outputs, attention_mask=attention_mask, return_dict=return_dict
+        )
 
 
 class Qwen25VLRewardModel(Qwen2_5_VLForConditionalGeneration, BaseQwenVLRewardModel):
@@ -344,9 +385,14 @@ class Qwen25VLRewardModel(Qwen2_5_VLForConditionalGeneration, BaseQwenVLRewardMo
             - Other standard outputs (loss, past_key_values, etc.)
         """
         return_dict = kwargs.get('return_dict', True)
+        attention_mask = kwargs.get('attention_mask')
+        if attention_mask is None and len(args) > 1:
+            attention_mask = args[1]
         kwargs['output_hidden_states'] = True
 
         outputs = super().forward(*args, **kwargs)
         
         # Step 2: Process outputs to add reward scores
-        return self.process_outputs_for_reward(outputs, return_dict)
+        return self.process_outputs_for_reward(
+            outputs, attention_mask=attention_mask, return_dict=return_dict
+        )
