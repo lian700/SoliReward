@@ -42,13 +42,16 @@ class InternVL35RewardModel(InternVLChatModel, InternVLBaseRewardModel):
             - bad_logits: Logit of "bad" token
         """
         return_dict = kwargs.get('return_dict', True)
+        attention_mask = kwargs.get('attention_mask')
+        if attention_mask is None and len(args) > 2:
+            attention_mask = args[2]
         kwargs['output_hidden_states'] = True
 
         # Call the InternVL3.5 chat model's forward pass
         outputs = InternVLChatModel.forward(self, *args, **kwargs)
         
         # Process outputs through base reward model
-        result = self.process_reward_outputs(outputs)
+        result = self.process_reward_outputs(outputs, attention_mask=attention_mask)
         
         if not return_dict:
             # Return as tuple if return_dict is False
